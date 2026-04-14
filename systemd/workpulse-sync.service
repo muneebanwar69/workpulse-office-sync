@@ -10,7 +10,7 @@ Type=oneshot
 User=workpulse
 WorkingDirectory=/home/workpulse/workpulse-office-sync
 ExecStart=/home/workpulse/workpulse-office-sync/run_sync.sh
-# Don't restart on failure — the timer will fire again at the next tick
+# Don't restart on failure -- the timer will fire again at the next tick
 StandardOutput=journal
 StandardError=journal
 

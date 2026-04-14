@@ -180,16 +180,33 @@ def login(api_base: str, email: str, password: str) -> str:
         log.error("Login failed: HTTP %s %s", resp.status_code, resp.text[:500])
         sys.exit(4)
 
-    data = resp.json().get("data") or {}
-    # Response shape varies: sometimes {tokens: {access, refresh}},
-    # sometimes {accessToken}. Accept both.
-    token = (
-        (data.get("tokens") or {}).get("access")
-        or data.get("accessToken")
-        or data.get("access_token")
-    )
+    raw = resp.json()
+    # The backend returns the token at the top level as `access_token`
+    # when hit directly (snake_case), but the frontend api client
+    # converts to camelCase so the JS side sees `accessToken`. The
+    # response may also be wrapped in a `data` envelope depending on
+    # endpoint. Accept every shape we've seen.
+    def _extract_token(obj) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return None
+        for key in ("access_token", "accessToken", "access"):
+            v = obj.get(key)
+            if isinstance(v, str) and v:
+                return v
+        tokens = obj.get("tokens")
+        if isinstance(tokens, dict):
+            for key in ("access", "access_token", "accessToken"):
+                v = tokens.get(key)
+                if isinstance(v, str) and v:
+                    return v
+        return None
+
+    token = _extract_token(raw) or _extract_token(raw.get("data") if isinstance(raw, dict) else None)
     if not token:
-        log.error("Login succeeded but no access token in response: %s", data)
+        log.error(
+            "Login succeeded but no access token in response. Keys: %s",
+            list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__,
+        )
         sys.exit(4)
     log.info("Login OK")
     return token

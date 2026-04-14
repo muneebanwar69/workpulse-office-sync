@@ -1,4 +1,4 @@
-# Credentials — NEVER commit real ones
+# Credentials -- NEVER commit real ones
 .env
 
 # Python
