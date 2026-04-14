@@ -1,0 +1,26 @@
+# Credentials — NEVER commit real ones
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Logs
+*.log
+sync.log
+
+# Local punch snapshots (from --save)
+backfill_punches.json
+punches_*.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

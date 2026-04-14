@@ -1,0 +1,20 @@
+[Unit]
+Description=Run WorkPulse attendance sync on a schedule
+Documentation=https://github.com/muneebanwar69/workpulse-office-sync
+
+[Timer]
+# Nightly catch-up at 02:30 — guarantees overnight 4PM-1AM shifts are
+# fully synced after all their post-midnight checkouts land.
+OnCalendar=*-*-* 02:30:00
+
+# Near-real-time updates every 5 minutes during the active day.
+# Remove this line if nightly-only is enough for you.
+OnCalendar=*-*-* 06..23:*:00/5
+
+# If the VM was off at the scheduled time, run immediately on boot.
+Persistent=true
+
+Unit=workpulse-sync.service
+
+[Install]
+WantedBy=timers.target

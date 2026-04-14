@@ -1,0 +1,18 @@
+[Unit]
+Description=WorkPulse attendance sync from ZKTeco K60
+Documentation=https://github.com/muneebanwar69/workpulse-office-sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Change the user and paths to match wherever you cloned the repo
+User=workpulse
+WorkingDirectory=/home/workpulse/workpulse-office-sync
+ExecStart=/home/workpulse/workpulse-office-sync/run_sync.sh
+# Don't restart on failure — the timer will fire again at the next tick
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
