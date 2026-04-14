@@ -1,17 +1,18 @@
 @echo off
-rem Windows wrapper: activates the venv (if any) and runs sync.py.
+rem Windows wrapper: runs sync.py and appends the full output to sync.log.
 rem Called by Task Scheduler.
 rem
-rem Task Scheduler throws away stdout/stderr by default, so silent
-rem failures inside sync.py are invisible in the Task Scheduler GUI
-rem (it just reports "Task completed" regardless of the Python exit
-rem code). To make scheduled runs auditable, this wrapper appends
-rem every run's full output to sync.log in the same folder, with a
-rem timestamped header and the final exit code.
+rem Important: Task Scheduler launches tasks in a limited non-interactive
+rem session that does NOT inherit the user's PATH. A `python` binary that
+rem works fine from your normal cmd prompt will silently fail when the
+rem same task runs under Task Scheduler, with exit code 9020 ("The system
+rem cannot execute the specified program").
 rem
-rem If a virtualenv exists at .venv/ we activate it; otherwise we
-rem just call the system-wide python (which works as long as pyzk
-rem and requests are pip-installed globally).
+rem To avoid that, we ALWAYS prefer the venv's python.exe by absolute
+rem path (no PATH lookup needed). Falls back to PATH-based `python` only
+rem if no venv exists — that fallback works for interactive runs but
+rem will fail under Task Scheduler unless python.exe is in the SYSTEM
+rem PATH (not just the user PATH).
 
 setlocal
 set SCRIPT_DIR=%~dp0
@@ -20,14 +21,17 @@ cd /d "%SCRIPT_DIR%"
 echo. >> sync.log
 echo ======== %date% %time% ======== >> sync.log
 
-if exist ".venv\Scripts\activate.bat" (
-    call ".venv\Scripts\activate.bat"
-    echo [info] activated .venv >> sync.log
+if exist ".venv\Scripts\python.exe" (
+    echo [info] using .venv\Scripts\python.exe >> sync.log
+    ".venv\Scripts\python.exe" sync.py %* >> sync.log 2>&1
 ) else (
-    echo [info] no .venv found, using system python >> sync.log
+    echo [info] no .venv found -- falling back to PATH python >> sync.log
+    echo [info] WARNING: this will fail under Task Scheduler unless >> sync.log
+    echo [info] python.exe is in the SYSTEM PATH, not just user PATH. >> sync.log
+    echo [info] Recommended: run "python -m venv .venv" then >> sync.log
+    echo [info] ".venv\Scripts\pip install -r requirements.txt" >> sync.log
+    python sync.py %* >> sync.log 2>&1
 )
 
-python sync.py %* >> sync.log 2>&1
 echo ======== exit code: %ERRORLEVEL% ======== >> sync.log
-
 endlocal
