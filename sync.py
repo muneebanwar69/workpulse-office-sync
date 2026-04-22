@@ -28,7 +28,7 @@ Typical usage:
 Configuration is read from environment variables (put them in .env
 next to the script -- the script auto-loads .env on startup):
 
-    WORKPULSE_API            https://ikonic-hcm.demosites.cc  (default)
+    WORKPULSE_API            https://hcm-api.owesome.work     (default)
     WORKPULSE_EMAIL          sync-bot@example.com             (required)
     WORKPULSE_PASSWORD       ********                         (required)
     WORKPULSE_COMPANY_ID     1                                (default 1)
@@ -52,7 +52,7 @@ from typing import Optional
 
 # -- Defaults ---------------------------------------------------------
 
-DEFAULT_API = "https://ikonic-hcm.demosites.cc"
+DEFAULT_API = "https://hcm-api.owesome.work"
 DEFAULT_DEVICE_IP = "192.168.101.247"
 DEFAULT_DEVICE_PORT = 4370
 DEFAULT_COMPANY_ID = 1

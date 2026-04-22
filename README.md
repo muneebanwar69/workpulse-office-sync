@@ -12,7 +12,7 @@ ZKTeco K60 (192.168.101.247:4370)
 Office VM (this repo)        ← cron / systemd / Task Scheduler
       │  HTTPS, JWT
       ▼
-ikonic-hcm.demosites.cc      ← /api/v1/attendance/backfill
+hcm-api.owesome.work         ← /api/v1/attendance/backfill
       │
       ▼
 Production Postgres          ← shift-aware attendance_records rows
@@ -221,7 +221,7 @@ flags. Precedence: **CLI flag > env var > .env file > hardcoded default**.
 
 | Setting | Env var | CLI flag | Default |
 |---|---|---|---|
-| Backend URL | `WORKPULSE_API` | `--api` | `https://ikonic-hcm.demosites.cc` |
+| Backend URL | `WORKPULSE_API` | `--api` | `https://hcm-api.owesome.work` |
 | Login email | `WORKPULSE_EMAIL` | `--email` | *required* |
 | Login password | `WORKPULSE_PASSWORD` | `--password` | *required* |
 | Company ID | `WORKPULSE_COMPANY_ID` | `--company-id` | `1` |
