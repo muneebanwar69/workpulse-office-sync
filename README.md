@@ -278,6 +278,40 @@ Benefits:
 
 ## Troubleshooting
 
+### `SSL: SSLV3_ALERT_HANDSHAKE_FAILURE` / `ssl.SSLError` on the VPS
+
+The script can't negotiate TLS with `hcm-api.owesome.work` because the
+local Python is linked against an OpenSSL too old for TLS 1.2+. The
+script prints a clear warning at startup if it detects this, and the
+login step exits with code `6` instead of pretending the sync worked.
+
+Fix on Ubuntu (20.04 / 22.04 / 24.04) — installs a modern Python 3.12:
+
+```bash
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3.12-distutils
+curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+python3.12 -m pip install -r requirements.txt
+
+# Sanity check (must print OpenSSL 1.1.1+ or 3.x, NOT 1.0.x):
+python3.12 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+
+# Run with the new Python directly:
+python3.12 sync.py
+```
+
+Then update your cron line to use `python3.12` instead of `python3`:
+
+```bash
+crontab -e
+# change e.g.
+#   30 2 * * * /usr/bin/python3 /opt/workpulse-office-sync/sync.py >> ...
+# to
+#   30 2 * * * /usr/local/bin/python3.12 /opt/workpulse-office-sync/sync.py >> ...
+# (run `which python3.12` to confirm the absolute path on your VPS)
+```
+
 ### `Failed to connect to device: [Errno timeout]`
 
 The ZKTeco K60 allows only ONE active TCP session. Something else is

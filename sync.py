@@ -45,10 +45,28 @@ import argparse
 import json
 import logging
 import os
+import ssl
 import sys
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional
+
+# `requests` is required for the backend calls. Imported lazily so the
+# helpful "pip install requests" message can fire before Python's own
+# ImportError noise.
+try:
+    import requests  # type: ignore
+    from requests.exceptions import (
+        ConnectionError as _ReqConnectionError,
+        SSLError as _ReqSSLError,
+        Timeout as _ReqTimeout,
+        RequestException as _ReqException,
+    )
+    _REQUESTS_OK = True
+except ImportError:  # pragma: no cover - handled at runtime in login()
+    requests = None  # type: ignore[assignment]
+    _ReqConnectionError = _ReqSSLError = _ReqTimeout = _ReqException = Exception  # type: ignore
+    _REQUESTS_OK = False
 
 # -- Defaults ---------------------------------------------------------
 
@@ -156,11 +174,50 @@ def filter_by_range(punches: list[dict], from_d: date, to_d: date) -> list[dict]
 # -- Backend API ------------------------------------------------------
 
 
+def _network_error_exit(stage: str, url: str, err: Exception) -> None:
+    """Log a clear, actionable message for a network failure and exit non-zero.
+
+    Bug history: a previous version of this script reported "attendance
+    synced" even when the upload silently failed because requests.post
+    raised a ConnectionError that wasn't caught explicitly. This helper
+    makes every network failure exit with a distinct, non-zero code and a
+    message that names the failure mode (DNS / TLS / timeout / refused).
+    """
+    if isinstance(err, _ReqSSLError):
+        log.error("%s FAILED: SSL/TLS handshake error contacting %s", stage, url)
+        log.error("  Underlying error: %s", err)
+        log.error(
+            "  This usually means the local Python is linked against an "
+            "OpenSSL too old to negotiate with the server (server requires "
+            "TLS 1.2+). Current OpenSSL on this machine: %s",
+            ssl.OPENSSL_VERSION,
+        )
+        log.error(
+            "  Fix: install Python 3.12 (deadsnakes PPA on Ubuntu) and "
+            "re-run the script with python3.12. See README -> 'TLS / SSL "
+            "errors on the VPS'."
+        )
+        sys.exit(6)
+    if isinstance(err, _ReqTimeout):
+        log.error("%s FAILED: request to %s timed out (%s)", stage, url, err)
+        log.error("  Check: server load / upstream proxy / network latency.")
+        sys.exit(7)
+    if isinstance(err, _ReqConnectionError):
+        log.error("%s FAILED: cannot reach %s (%s)", stage, url, err)
+        log.error(
+            "  Check: machine has internet, DNS resolves the host, "
+            "and no firewall is blocking the connection. The sync did "
+            "NOT complete -- do not treat this run as successful."
+        )
+        sys.exit(8)
+    # Anything else from the requests stack -- still treat as fatal.
+    log.error("%s FAILED: %s", stage, err)
+    sys.exit(9)
+
+
 def login(api_base: str, email: str, password: str) -> str:
     """Log in to the WorkPulse backend and return a JWT access token."""
-    try:
-        import requests
-    except ImportError:
+    if not _REQUESTS_OK:
         log.error("requests is not installed. Run: pip install requests")
         sys.exit(2)
 
@@ -172,9 +229,9 @@ def login(api_base: str, email: str, password: str) -> str:
             json={"email": email, "password": password},
             timeout=30,
         )
-    except Exception as e:
-        log.error("Login request failed: %s", e)
-        sys.exit(4)
+    except _ReqException as e:
+        _network_error_exit("LOGIN", url, e)
+        return ""  # unreachable; satisfies type checker
 
     if not resp.ok:
         log.error("Login failed: HTTP %s %s", resp.status_code, resp.text[:500])
@@ -217,8 +274,16 @@ def post_backfill(
     from_d: date, to_d: date,
     punches: list[dict], company_id: int,
 ) -> dict:
-    """POST a batch of punches to /attendance/backfill."""
-    import requests
+    """POST a batch of punches to /attendance/backfill.
+
+    Any network failure here (connection drop, TLS error, timeout) is
+    fatal -- we exit non-zero with a clear message via _network_error_exit
+    rather than silently swallow it and let the cron wrapper print
+    "exit code: 0" as if the upload had succeeded.
+    """
+    if not _REQUESTS_OK:
+        log.error("requests is not installed. Run: pip install requests")
+        sys.exit(2)
 
     body = {
         "from_date": from_d.isoformat(),
@@ -230,20 +295,30 @@ def post_backfill(
     url = f"{api_base.rstrip('/')}/api/v1/attendance/backfill"
     log.info("POST %s (%d punches, %s..%s)", url, len(punches), from_d, to_d)
 
-    resp = requests.post(
-        url,
-        json=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        timeout=900,
-    )
+    try:
+        resp = requests.post(
+            url,
+            json=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=900,
+        )
+    except _ReqException as e:
+        _network_error_exit("BACKFILL", url, e)
+        return {}  # unreachable
+
     log.info("HTTP %s", resp.status_code)
     if not resp.ok:
         log.error("Body: %s", resp.text[:2000])
         sys.exit(5)
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError as e:
+        log.error("Backfill response was not JSON: %s -- body[:500]=%r",
+                  e, resp.text[:500])
+        sys.exit(5)
 
 
 # -- Sync orchestration -----------------------------------------------
@@ -294,6 +369,10 @@ def do_sync(
                 totals[k] = totals.get(k, 0) + v
         cursor = chunk_to + timedelta(days=1)
 
+    # Only printed if every chunk POST returned 2xx. If any chunk had
+    # raised, _network_error_exit / sys.exit(5) would have killed the
+    # process before we got here -- so seeing this line in the log means
+    # the upload genuinely succeeded.
     log.info("========== SYNC COMPLETE ==========")
     for k, v in sorted(totals.items()):
         log.info("  %-22s %s", k, v)
@@ -335,11 +414,33 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _warn_if_openssl_too_old() -> None:
+    """Print a loud warning if the bundled OpenSSL is too old to negotiate
+    modern TLS with hcm-api.owesome.work. The actual SSL handshake error
+    is also caught later in login() with a clearer hint, but emitting
+    this at startup makes the failure mode obvious before the first
+    network call."""
+    ver = ssl.OPENSSL_VERSION
+    # OpenSSL versions sort lexicographically only within a major. The
+    # known-bad bucket is 0.x and 1.0.0/1.0.1 which can't do TLS 1.2
+    # reliably. 1.0.2 / 1.1.x / 3.x are fine.
+    bad = ver.startswith("OpenSSL 0.") or ver.startswith("OpenSSL 1.0.0") or ver.startswith("OpenSSL 1.0.1")
+    if bad:
+        log.warning("=" * 60)
+        log.warning("OpenSSL on this machine is %s -- likely too old.", ver)
+        log.warning("hcm-api.owesome.work requires TLS 1.2+. Expect SSL")
+        log.warning("handshake failures. Install Python 3.12 (deadsnakes")
+        log.warning("PPA on Ubuntu) and re-run with python3.12.")
+        log.warning("=" * 60)
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    _warn_if_openssl_too_old()
 
     args = parse_args()
 
