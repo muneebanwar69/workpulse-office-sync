@@ -208,9 +208,41 @@ Click OK, enter the user password when prompted.
 
 ### 9. View logs
 
-`C:\workpulse-office-sync\sync.log` (the `run_sync.cmd` wrapper appends
-stdout+stderr there when run via cron/task scheduler). Or check Task
-Scheduler → Task history for the exit codes.
+The Windows wrapper writes **one log file per day**, named
+`sync-YYYY-MM-DD.log` (e.g. `sync-2026-07-09.log`). Each run appends a
+timestamped header, its stdout+stderr, and a footer with the exit code,
+so a single day's file contains every run for that day. Files older
+than 30 days are auto-deleted on the next run.
+
+Use the bundled `view_log.cmd` helper — no arguments needed for the
+common case:
+
+```cmd
+rem Show today's log
+view_log
+
+rem Show yesterday's log
+view_log yesterday
+
+rem Show a specific date
+view_log 2026-07-05
+
+rem List all available log files (newest first)
+view_log list
+```
+
+Or use the raw file directly:
+
+```cmd
+type sync-2026-07-09.log
+dir /b /o-n sync-*.log
+```
+
+> **Note:** `type sync.log` (no date) will fail with "The system cannot
+> find the file specified" — the wrapper no longer writes to a plain
+> `sync.log`. Use `view_log` or `sync-YYYY-MM-DD.log` instead.
+
+For exit codes at a glance, check Task Scheduler → Task history.
 
 ---
 
@@ -256,6 +288,31 @@ python sync.py --loop 60
 # Override device IP for a test
 python sync.py --device-ip 192.168.101.248 --dry-run
 ```
+
+### Wrapper shortcut: `run_sync` with date args
+
+Both wrappers (`run_sync.cmd` on Windows, `run_sync.sh` on Linux) accept
+up to two positional dates and translate them into `--from`/`--to` for
+`sync.py`. Same syntax on both platforms.
+
+```cmd
+rem Windows
+run_sync                          rem default: SYNC_WINDOW_DAYS from .env
+run_sync 2026-07-05               rem one day
+run_sync 2026-07-01 2026-07-05    rem inclusive range
+```
+
+```bash
+# Linux
+./run_sync.sh                          # default: SYNC_WINDOW_DAYS from .env
+./run_sync.sh 2026-07-05               # one day
+./run_sync.sh 2026-07-01 2026-07-05    # inclusive range
+```
+
+Dates must be `YYYY-MM-DD`; a malformed date exits `1` with a usage
+line before any work happens. Task Scheduler / systemd / cron all
+invoke the wrappers with no args, so the scheduled path is unchanged
+— this is only for manual one-off backfills.
 
 ---
 
@@ -357,8 +414,13 @@ Two common causes:
 
 ### Task Scheduler shows "Last Run Result: 0x1"
 
-The `.cmd` wrapper exited with an error. Check `sync.log` next to the
-script for the Python traceback.
+The `.cmd` wrapper exited with an error. Check today's per-day log file
+next to the script for the Python traceback — `view_log` prints today's
+in one command, or grab it directly:
+
+```cmd
+type sync-YYYY-MM-DD.log
+```
 
 ### Want to disable the sync temporarily
 
@@ -414,7 +476,8 @@ workpulse-office-sync/
 ├── .env.example                 ← copy to .env and fill in secrets
 ├── .gitignore                   ← keeps .env / logs out of git
 ├── run_sync.sh                  ← Linux wrapper (activates venv)
-├── run_sync.cmd                 ← Windows wrapper (activates venv)
+├── run_sync.cmd                 ← Windows wrapper (per-day sync-YYYY-MM-DD.log)
+├── view_log.cmd                 ← Windows log reader (today / yesterday / date / list)
 └── systemd/
     ├── workpulse-sync.service   ← systemd unit (Linux)
     └── workpulse-sync.timer     ← systemd timer (Linux)
