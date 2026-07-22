@@ -28,10 +28,11 @@ Typical usage:
 Configuration is read from environment variables (put them in .env
 next to the script -- the script auto-loads .env on startup):
 
-    WORKPULSE_API            https://hcm-api.owesome.work     (default)
+    WORKPULSE_API            https://hr-api.owesome.work      (sync API)
+    OWESOME_IDP_URL          https://api.owesome.work         (login/IdP)
     WORKPULSE_EMAIL          sync-bot@example.com             (required)
     WORKPULSE_PASSWORD       ********                         (required)
-    WORKPULSE_COMPANY_ID     1                                (default 1)
+    WORKPULSE_WORKSPACE_ID   <owesome-workspace-uuid>         (required)
     DEVICE_IP                192.168.101.247                  (default)
     DEVICE_PORT              4370                             (default)
     SYNC_WINDOW_DAYS         1      (0 = today only, 1 = yesterday+today)
@@ -70,10 +71,14 @@ except ImportError:  # pragma: no cover - handled at runtime in login()
 
 # -- Defaults ---------------------------------------------------------
 
-DEFAULT_API = "https://hcm-api.owesome.work"
+# Attendance/sync API (the HR backend). Auth changed with the Owesome SSO
+# cutover: we now log in against the Owesome IdP and call this API with that
+# token + the workspace id (see DEFAULT_IDP / WORKPULSE_WORKSPACE_ID).
+DEFAULT_API = "https://hr-api.owesome.work"
+# Owesome IdP — where credentials are verified now (returns the access token).
+DEFAULT_IDP = "https://api.owesome.work"
 DEFAULT_DEVICE_IP = "192.168.101.247"
 DEFAULT_DEVICE_PORT = 4370
-DEFAULT_COMPANY_ID = 1
 
 log = logging.getLogger("workpulse-sync")
 
@@ -215,14 +220,19 @@ def _network_error_exit(stage: str, url: str, err: Exception) -> None:
     sys.exit(9)
 
 
-def login(api_base: str, email: str, password: str) -> str:
-    """Log in to the WorkPulse backend and return a JWT access token."""
+def login(idp_base: str, email: str, password: str) -> str:
+    """Log in against the Owesome IdP and return its access token.
+
+    Post-SSO cutover the HR backend no longer verifies credentials itself — the
+    Owesome IdP does. The returned RS256 identity token is what the sync API
+    (hr-api) accepts, together with the X-Workspace-Id header (see post_backfill).
+    """
     if not _REQUESTS_OK:
         log.error("requests is not installed. Run: pip install requests")
         sys.exit(2)
 
-    url = f"{api_base.rstrip('/')}/api/v1/auth/login"
-    log.info("Logging in as %s ...", email)
+    url = f"{idp_base.rstrip('/')}/api/v1/auth/login"
+    log.info("Logging in as %s (Owesome IdP) ...", email)
     try:
         resp = requests.post(
             url,
@@ -270,11 +280,14 @@ def login(api_base: str, email: str, password: str) -> str:
 
 
 def post_backfill(
-    api_base: str, token: str,
+    api_base: str, token: str, workspace_id: str,
     from_d: date, to_d: date,
-    punches: list[dict], company_id: int,
+    punches: list[dict],
 ) -> dict:
     """POST a batch of punches to /attendance/backfill.
+
+    Sends the Owesome IdP token plus X-Workspace-Id, which is how the HR backend
+    resolves the tenant (company), role and permissions post-SSO.
 
     Any network failure here (connection drop, TLS error, timeout) is
     fatal -- we exit non-zero with a clear message via _network_error_exit
@@ -301,6 +314,7 @@ def post_backfill(
             json=body,
             headers={
                 "Authorization": f"Bearer {token}",
+                "X-Workspace-Id": workspace_id,
                 "Content-Type": "application/json",
             },
             timeout=900,
@@ -325,12 +339,12 @@ def post_backfill(
 
 
 def do_sync(
-    api: str, email: str, password: str, company_id: int,
+    api: str, idp: str, email: str, password: str, workspace_id: str,
     device_ip: str, device_port: int,
     from_d: date, to_d: date,
     dry_run: bool,
 ) -> None:
-    """One sync pass: pull device -> login -> POST by 31-day chunks."""
+    """One sync pass: pull device -> IdP login -> POST by 31-day chunks."""
     punches = pull_all_punches(device_ip, device_port)
     if not punches:
         log.error("No punches on device -- nothing to do")
@@ -350,7 +364,7 @@ def do_sync(
         log.info("Dry run -- NOT posting to backend")
         return
 
-    token = login(api, email, password)
+    token = login(idp, email, password)
 
     # Chunk by 31 days to keep each POST small
     CHUNK_DAYS = 31
@@ -360,7 +374,7 @@ def do_sync(
         chunk_to = min(cursor + timedelta(days=CHUNK_DAYS - 1), to_d)
         chunk_punches = filter_by_range(in_range, cursor, chunk_to)
         log.info("--- chunk %s..%s : %d punches", cursor, chunk_to, len(chunk_punches))
-        resp = post_backfill(api, token, cursor, chunk_to, chunk_punches, company_id)
+        resp = post_backfill(api, token, workspace_id, cursor, chunk_to, chunk_punches)
         data = resp.get("data") or resp
         t = data.get("totals") or {}
         log.info("  -> %s", t)
@@ -399,7 +413,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--api", help="Backend base URL (env: WORKPULSE_API)")
     p.add_argument("--email", help="Login email (env: WORKPULSE_EMAIL)")
     p.add_argument("--password", help="Login password (env: WORKPULSE_PASSWORD)")
-    p.add_argument("--company-id", type=int, help="Company ID (env: WORKPULSE_COMPANY_ID)")
     p.add_argument("--device-ip", help="Device IP (env: DEVICE_IP)")
     p.add_argument("--device-port", type=int, help="Device port (env: DEVICE_PORT)")
     p.add_argument("--from", dest="from_date",
@@ -416,10 +429,9 @@ def parse_args() -> argparse.Namespace:
 
 def _warn_if_openssl_too_old() -> None:
     """Print a loud warning if the bundled OpenSSL is too old to negotiate
-    modern TLS with hcm-api.owesome.work. The actual SSL handshake error
-    is also caught later in login() with a clearer hint, but emitting
-    this at startup makes the failure mode obvious before the first
-    network call."""
+    modern TLS with the Owesome hosts. This ONLY catches genuinely old OpenSSL
+    (0.x / 1.0.x); a modern OpenSSL that still fails the handshake is a host/edge
+    TLS mismatch, not this — see README 'SSLV3_ALERT_HANDSHAKE_FAILURE', Case B."""
     ver = ssl.OPENSSL_VERSION
     # OpenSSL versions sort lexicographically only within a major. The
     # known-bad bucket is 0.x and 1.0.0/1.0.1 which can't do TLS 1.2
@@ -428,7 +440,7 @@ def _warn_if_openssl_too_old() -> None:
     if bad:
         log.warning("=" * 60)
         log.warning("OpenSSL on this machine is %s -- likely too old.", ver)
-        log.warning("hcm-api.owesome.work requires TLS 1.2+. Expect SSL")
+        log.warning("The Owesome hosts require TLS 1.2+. Expect SSL")
         log.warning("handshake failures. Install Python 3.12 (deadsnakes")
         log.warning("PPA on Ubuntu) and re-run with python3.12.")
         log.warning("=" * 60)
@@ -452,12 +464,10 @@ def main() -> int:
 
     # Resolve config (CLI > env > default)
     api = args.api or os.environ.get("WORKPULSE_API") or DEFAULT_API
+    idp = os.environ.get("OWESOME_IDP_URL") or DEFAULT_IDP
     email = args.email or os.environ.get("WORKPULSE_EMAIL", "")
     password = args.password or os.environ.get("WORKPULSE_PASSWORD", "")
-    company_id = (
-        args.company_id
-        or int(os.environ.get("WORKPULSE_COMPANY_ID", DEFAULT_COMPANY_ID))
-    )
+    workspace_id = os.environ.get("WORKPULSE_WORKSPACE_ID", "").strip()
     device_ip = args.device_ip or os.environ.get("DEVICE_IP") or DEFAULT_DEVICE_IP
     device_port = (
         args.device_port
@@ -469,6 +479,14 @@ def main() -> int:
         log.error(
             "WORKPULSE_EMAIL / WORKPULSE_PASSWORD must be set (env or .env "
             "file). See .env.example."
+        )
+        return 1
+
+    if not args.dry_run and not workspace_id:
+        log.error(
+            "WORKPULSE_WORKSPACE_ID must be set (the Owesome workspace UUID for "
+            "this company) — the HR API needs it to resolve the tenant. See "
+            ".env.example."
         )
         return 1
 
@@ -490,7 +508,7 @@ def main() -> int:
             try:
                 from_d, to_d = resolve_dates()
                 do_sync(
-                    api, email, password, company_id,
+                    api, idp, email, password, workspace_id,
                     device_ip, device_port, from_d, to_d, args.dry_run,
                 )
             except SystemExit as e:
@@ -502,7 +520,7 @@ def main() -> int:
 
     from_d, to_d = resolve_dates()
     do_sync(
-        api, email, password, company_id,
+        api, idp, email, password, workspace_id,
         device_ip, device_port, from_d, to_d, args.dry_run,
     )
     return 0

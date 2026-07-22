@@ -9,14 +9,23 @@ production backend. Keeps every employee's timesheet up-to-date automatically,
 ZKTeco K60 (192.168.101.247:4370)
       │  LAN, pyzk TCP protocol
       ▼
-Office VM (this repo)        ← cron / systemd / Task Scheduler
-      │  HTTPS, JWT
+Office VM (this repo)          ← cron / systemd / Task Scheduler
+      │  1) HTTPS  login (email + password)
       ▼
-hcm-api.owesome.work         ← /api/v1/attendance/backfill
+api.owesome.work              ← Owesome IdP: verifies creds, returns access token
+      │  2) HTTPS  token + X-Workspace-Id
+      ▼
+hr-api.owesome.work           ← /api/v1/attendance/backfill
       │
       ▼
-Production Postgres          ← shift-aware attendance_records rows
+Production Postgres            ← shift-aware attendance_records rows
 ```
+
+> **Auth changed with the Owesome SSO cutover.** Credentials are now verified by
+> the **Owesome IdP** (`api.owesome.work`), not the HR backend. The script logs
+> in there, then sends the returned token **plus `X-Workspace-Id`** to the HR
+> sync API (`hr-api.owesome.work`), which resolves the tenant, role and
+> permissions from the workspace.
 
 Zero dependency on the backend repo. Only two pip packages. Designed to
 run on a tiny Linux or Windows VM that has LAN reach to the device and
@@ -30,8 +39,9 @@ internet reach to the backend.
 2. Pulls every punch the device has in its memory (typically ~20k rows, ~7 s)
 3. Filters them to the target date range (default: yesterday + today, to
    catch late overnight 4 PM–1 AM shifts whose checkout lands after midnight)
-4. Logs in to WorkPulse with a service account → gets a fresh JWT
-5. POSTs the punches to `POST /api/v1/attendance/backfill` in 31-day chunks
+4. Logs in to the **Owesome IdP** with a service account → gets a fresh access token
+5. POSTs the punches to `hr-api …/api/v1/attendance/backfill` (with the token +
+   `X-Workspace-Id`) in 31-day chunks
 6. Backend runs them through the **shift-aware attendance calculator**
    (handles late / early departure / half-day / overnight / holiday /
    weekend / leave / WFH precedence), then UPSERTs `attendance_records`
@@ -64,7 +74,7 @@ pip install -r requirements.txt
 
 # 4. Credentials
 cp .env.example .env
-nano .env      # fill in WORKPULSE_EMAIL and WORKPULSE_PASSWORD
+nano .env      # fill in WORKPULSE_EMAIL, WORKPULSE_PASSWORD, WORKPULSE_WORKSPACE_ID
 chmod 600 .env
 
 # 5. Smoke-test the device connection (NO backend call)
@@ -146,7 +156,8 @@ pip install -r requirements.txt
 copy .env.example .env
 notepad .env
 ```
-Fill in `WORKPULSE_EMAIL` and `WORKPULSE_PASSWORD`, save, close.
+Fill in `WORKPULSE_EMAIL`, `WORKPULSE_PASSWORD` and `WORKPULSE_WORKSPACE_ID`,
+save, close.
 
 Lock the file: right-click `.env` → Properties → Security → remove Users,
 keep only SYSTEM + your own account.
@@ -253,10 +264,11 @@ flags. Precedence: **CLI flag > env var > .env file > hardcoded default**.
 
 | Setting | Env var | CLI flag | Default |
 |---|---|---|---|
-| Backend URL | `WORKPULSE_API` | `--api` | `https://hcm-api.owesome.work` |
+| Sync API (HR backend) | `WORKPULSE_API` | `--api` | `https://hr-api.owesome.work` |
+| Owesome IdP (login) | `OWESOME_IDP_URL` | — | `https://api.owesome.work` |
 | Login email | `WORKPULSE_EMAIL` | `--email` | *required* |
 | Login password | `WORKPULSE_PASSWORD` | `--password` | *required* |
-| Company ID | `WORKPULSE_COMPANY_ID` | `--company-id` | `1` |
+| Workspace UUID (`X-Workspace-Id`) | `WORKPULSE_WORKSPACE_ID` | — | *required* |
 | Device IP | `DEVICE_IP` | `--device-ip` | `192.168.101.247` |
 | Device port | `DEVICE_PORT` | `--device-port` | `4370` |
 | Sync window (days back) | `SYNC_WINDOW_DAYS` | — | `1` |
@@ -264,6 +276,11 @@ flags. Precedence: **CLI flag > env var > .env file > hardcoded default**.
 | To date | — | `--to YYYY-MM-DD` | today |
 | Dry run | — | `--dry-run` | off |
 | Continuous loop | — | `--loop SECONDS` | off |
+
+> `WORKPULSE_WORKSPACE_ID` is the Owesome **workspace UUID** for this company
+> (from the workspace URL or an admin). The HR API needs it to resolve which
+> tenant the punches belong to. The old `WORKPULSE_COMPANY_ID` is gone — the
+> company is derived from the workspace now.
 
 ---
 
@@ -318,13 +335,17 @@ invoke the wrappers with no args, so the scheduled path is unchanged
 
 ## Recommended setup: dedicated service account
 
-Don't use your personal CEO login as the sync credential. In WorkPulse:
+Don't use your personal CEO login as the sync credential. Post-SSO the service
+account must be a proper **Owesome identity** with HR access:
 
-1. Log in as CEO → **Setup → User Accounts → New**
-2. Create employee `Sync Bot` with email `sync-bot@ikonicsolution.com`
-3. Assign role: `it_admin` **or** a custom role with exactly
-   `devices:manage` + `attendance:create` + `employee:view_all` permissions
-4. Set a strong random password and paste into `.env`
+1. It exists as an **Owesome account** (email + password that works at
+   `api.owesome.work`), e.g. `sync-bot@ikonicsolution.com`.
+2. It is a **member of the workspace** in `WORKPULSE_WORKSPACE_ID`, and that
+   workspace has an **active HR subscription**.
+3. In HR it holds a role granting **`devices:manage`** or **`attendance:create`**
+   (e.g. `super_admin` / `hr_admin`, or a custom role with exactly those
+   permissions). HR owns its roles, so once assigned it stays put across logins.
+4. Set a strong password and paste it into `.env`.
 
 Benefits:
 - Rotating this password won't log you out of the real CEO session
@@ -337,12 +358,15 @@ Benefits:
 
 ### `SSL: SSLV3_ALERT_HANDSHAKE_FAILURE` / `ssl.SSLError` on the VPS
 
-The script can't negotiate TLS with `hcm-api.owesome.work` because the
-local Python is linked against an OpenSSL too old for TLS 1.2+. The
-script prints a clear warning at startup if it detects this, and the
-login step exits with code `6` instead of pretending the sync worked.
+A TLS handshake with the host was rejected. **First check which cause it is** —
+what does Python's own OpenSSL report?
 
-Fix on Ubuntu (20.04 / 22.04 / 24.04) — installs a modern Python 3.12:
+```bash
+python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+```
+
+**Case A — OpenSSL is old (`OpenSSL 0.x` or `1.0.x`).** It genuinely can't do
+TLS 1.2+. Install a modern Python 3.12 on Ubuntu:
 
 ```bash
 sudo add-apt-repository -y ppa:deadsnakes/ppa
@@ -350,24 +374,31 @@ sudo apt update
 sudo apt install -y python3.12 python3.12-venv python3.12-distutils
 curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
 python3.12 -m pip install -r requirements.txt
-
-# Sanity check (must print OpenSSL 1.1.1+ or 3.x, NOT 1.0.x):
-python3.12 -c "import ssl; print(ssl.OPENSSL_VERSION)"
-
-# Run with the new Python directly:
 python3.12 sync.py
+# then point cron/systemd at `python3.12` (run `which python3.12` for the path)
 ```
 
-Then update your cron line to use `python3.12` instead of `python3`:
+**Case B — OpenSSL is already modern (`1.1.1` / `3.x`) but the handshake still
+fails.** This is *not* an old-Python problem — it's a host/edge TLS mismatch (the
+new `hr-api.owesome.work` is fronted by Cloudflare with a stricter TLS profile
+than the old `hcm-api` had). Diagnose from the VPS:
 
 ```bash
-crontab -e
-# change e.g.
-#   30 2 * * * /usr/bin/python3 /opt/workpulse-office-sync/sync.py >> ...
-# to
-#   30 2 * * * /usr/local/bin/python3.12 /opt/workpulse-office-sync/sync.py >> ...
-# (run `which python3.12` to confirm the absolute path on your VPS)
+# raw handshake — does OpenSSL itself fail, or just Python/requests?
+openssl s_client -connect hr-api.owesome.work:443 -servername hr-api.owesome.work </dev/null | head -20
+
+# does a plain HTTPS GET work at all?
+curl -sS -o /dev/null -w "%{http_code}\n" https://hr-api.owesome.work/
 ```
+
+If `openssl s_client` / `curl` also fail, it's the edge — fix it in **Cloudflare**
+(SSL/TLS → Edge Certificates → set **Minimum TLS Version** to 1.2 and confirm the
+zone's cipher profile is compatible with your clients). If they succeed but
+Python fails, a restrictive system `openssl.cnf` (SECLEVEL / disabled groups) on
+that box is the culprit.
+
+> The `login` step exits with code `6` on any SSL error rather than pretending
+> the sync worked, and prints Python's OpenSSL version to help you tell A from B.
 
 ### `Failed to connect to device: [Errno timeout]`
 
@@ -385,15 +416,18 @@ sc stop ZKBioTime
 sudo systemctl stop zkbiotime 2>/dev/null
 ```
 
-### `HTTP 401 Unauthorized` on backfill
+### `HTTP 401 / 403 / 400` on backfill (after a successful login)
 
-The login worked but the returned token doesn't have the right
-permissions. Either:
-- Your service account lacks `devices:manage` / `attendance:create`, OR
-- The JWT expired between login and POST (shouldn't happen — tokens are
-  valid for ~3 months)
+The IdP login worked but the HR sync API rejected the token. Common causes:
+- **400 `no workspace` / missing context** — `WORKPULSE_WORKSPACE_ID` is unset or
+  wrong. It must be the Owesome **workspace UUID** for this company.
+- **403 `not subscribed` / `no HR access`** — that workspace has no active HR
+  entitlement, or the service account isn't a member of it.
+- **403 permission denied** — the account's HR role lacks `devices:manage` /
+  `attendance:create`. Assign it a role that has them (e.g. `hr_admin`).
+- **401 token invalid/expired** — re-run (a fresh token is fetched each run).
 
-Fix the role in WorkPulse → **Setup → Roles & Permissions** and re-run.
+Fix the workspace membership / role in HR and re-run.
 
 ### `unmapped_device_users: ["999", "1001"]` in the summary
 
