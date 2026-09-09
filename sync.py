@@ -136,11 +136,17 @@ def pull_all_punches(ip: str, port: int) -> list[dict]:
         all_logs = conn.get_attendance()
         log.info("Pulled %d punches from device", len(all_logs))
 
+        # `punch` is the in/out code (0=C/In, 1/3/5=C/Out) -- the only field
+        # that says which direction a scan was. `status` is the verify mode
+        # (constant 1 on this firmware); the backend reads it as a direction
+        # when `punch` is missing, which flagged every scan as a check-out.
         return [
             {
                 "user_id": str(a.user_id),
                 "timestamp": a.timestamp.isoformat(),
-                "status": int(getattr(a, "status", 0) or 0),
+                "punch": (
+                    int(a.punch) if isinstance(getattr(a, "punch", None), int) else None
+                ),
             }
             for a in all_logs
         ]
@@ -343,6 +349,7 @@ def do_sync(
     device_ip: str, device_port: int,
     from_d: date, to_d: date,
     dry_run: bool,
+    only_user: str | None = None,
 ) -> None:
     """One sync pass: pull device -> IdP login -> POST by 31-day chunks."""
     punches = pull_all_punches(device_ip, device_port)
@@ -356,11 +363,28 @@ def do_sync(
     in_range = filter_by_range(punches, from_d, to_d)
     log.info("Punches in target range %s..%s: %d", from_d, to_d, len(in_range))
 
+    if only_user:
+        # Diagnostic: "the device shows a punch but the timesheet is empty".
+        # Print that user's actual rows so the device can be ruled in or out
+        # before anyone goes looking at the backend.
+        mine = [p for p in in_range if p["user_id"] == only_user]
+        log.info("Punches for device user %s in range: %d", only_user, len(mine))
+        for p in sorted(mine, key=lambda x: x["timestamp"]):
+            log.info("  %s  punch=%s", p["timestamp"], p["punch"])
+        if not mine:
+            log.warning(
+                "Device returned NO punches for user %s in %s..%s -- the loss is "
+                "on the device side (cleared memory, or a different device), "
+                "not in the upload.", only_user, from_d, to_d,
+            )
+
     if dry_run:
         by_user: dict[str, int] = {}
         for p in in_range:
             by_user[p["user_id"]] = by_user.get(p["user_id"], 0) + 1
         log.info("Distinct device users in range: %d", len(by_user))
+        for uid, n in sorted(by_user.items(), key=lambda kv: (-kv[1], kv[0])):
+            log.info("  user %-10s %d punches", uid, n)
         log.info("Dry run -- NOT posting to backend")
         return
 
@@ -420,6 +444,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--to", dest="to_date", help="YYYY-MM-DD, default: today")
     p.add_argument("--dry-run", action="store_true",
                    help="Pull from device + summarize, don't POST")
+    p.add_argument("--user", dest="only_user", metavar="DEVICE_USER_ID",
+                   help="Debug: log this device user's punches in the range")
     p.add_argument("--loop", type=int, metavar="SECONDS",
                    help="Run forever, sleeping SECONDS between runs")
     p.add_argument("--env-file", default=None,
@@ -510,6 +536,7 @@ def main() -> int:
                 do_sync(
                     api, idp, email, password, workspace_id,
                     device_ip, device_port, from_d, to_d, args.dry_run,
+                    args.only_user,
                 )
             except SystemExit as e:
                 log.error("Sync exited with code %s -- will retry next tick", e.code)
@@ -522,6 +549,7 @@ def main() -> int:
     do_sync(
         api, idp, email, password, workspace_id,
         device_ip, device_port, from_d, to_d, args.dry_run,
+        args.only_user,
     )
     return 0
 
